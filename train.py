@@ -93,22 +93,23 @@ def get_training_config():
     # RTX 4060 / Small GPU (8GB)
     return {
         "batch_size": 1,
-        "gradient_accumulation_steps": 8,  # Effective batch = 8 (faster)
-        "learning_rate": 2e-4,
-        "num_epochs": 25,  # More epochs to compensate
-        "max_seq_length": 1024,  # Much smaller for speed
-        "warmup_steps": 50,
-        "save_steps": 500,
+        "gradient_accumulation_steps": 8,  # Effective batch = 8
+        "learning_rate": 3e-4,  # Higher LR for faster convergence
+        "num_epochs": 4,  # 3000/8 = 375 steps/epoch, 4 epochs = 1500 steps
+        "max_seq_length": 1024,
+        "warmup_steps": 30,  # Reduced warmup
+        "save_steps": 300,  # Save every ~epoch
         "logging_steps": 5,
         "fp16": True,
         "bf16": False,
-        "save_total_limit": 2,  # Keep fewer checkpoints
+        "save_total_limit": 2,
         "lr_scheduler": "cosine",
         "weight_decay": 0.01,
         "use_8bit": True,
-        "lora_rank": 8,  # Smaller for speed
-        "dataloader_num_workers": 0,  # Disable workers for stability
+        "lora_rank": 8,
+        "dataloader_num_workers": 0,
         "gradient_checkpointing": True,
+        "max_examples": 3000,  # Only use 3000 examples
     }
 
 TRAINING_CONFIG = get_training_config()
@@ -138,12 +139,16 @@ def load_and_prepare_data():
     """Load JSONL training data with content validation"""
     print("📂 Loading training data...")
     
+    max_examples = TRAINING_CONFIG.get("max_examples", None)
     data = []
     truncated_count = 0
     total_chars = 0
     
     with open(TRAINING_DATA, 'r', encoding='utf-8') as f:
-        for line in f:
+        for i, line in enumerate(f):
+            if max_examples and i >= max_examples:
+                break
+                
             if line.strip():
                 item = json.loads(line)
                 text = item["text"]
@@ -160,7 +165,7 @@ def load_and_prepare_data():
                     truncated_count += 1
     
     avg_length = total_chars // len(data) if data else 0
-    print(f"✓ Loaded {len(data)} training examples")
+    print(f"✓ Loaded {len(data)} training examples{f' (limited to {max_examples})' if max_examples else ''}")
     print(f"  Average length: {avg_length:,} characters")
     if truncated_count > 0:
         print(f"  ⚠️  {truncated_count} examples may be truncated or incomplete")
