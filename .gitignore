@@ -1,0 +1,13 @@
+node_modules/
+dist/
+.env
+*.log
+*.pyc
+__pycache__/
+models/
+checkpoints/
+fine-tuned-model/
+logs/
+.vscode/
+*.swp
+*.swo

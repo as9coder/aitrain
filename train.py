@@ -1,0 +1,338 @@
+"""
+Fine-tune Qwen2.5-Coder-1.5B-Instruct on RTX 4060 (8GB VRAM)
+Uses LoRA for memory efficiency
+"""
+
+import os
+import json
+import torch
+from transformers import (
+    AutoModelForCausalLM,
+    AutoTokenizer,
+    TrainingArguments,
+    Trainer,
+    DataCollatorForLanguageModeling,
+    TrainerCallback
+)
+from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
+from datasets import Dataset
+import bitsandbytes as bnb
+from tqdm import tqdm
+import time
+
+# Configuration
+MODEL_PATH = "./models/qwen2.5-coder-1.5b-instruct"
+TRAINING_DATA = "./training_data.jsonl"
+OUTPUT_DIR = "./fine-tuned-model"
+CHECKPOINT_DIR = "./checkpoints"
+
+# Special tokens from our training data format
+SPECIAL_TOKENS = {
+    "additional_special_tokens": [
+        "<|start|>",
+        "<|end|>",
+        "<|user|>",
+        "<|assistant|>",
+        "<|tool_start|>",
+        "<|tool_end|>",
+        "<|code_start|>",
+        "<|code_end|>",
+        "<TOOL_CALL>",
+        "</TOOL_CALL>"
+    ]
+}
+
+# RTX 4060 optimized settings (8GB VRAM)
+TRAINING_CONFIG = {
+    "batch_size": 1,  # Small batch for 8GB VRAM
+    "gradient_accumulation_steps": 8,  # Effective batch size = 8
+    "learning_rate": 2e-4,
+    "num_epochs": 15,  # More epochs to fully learn all content
+    "max_seq_length": 4096,  # Longer sequences to capture full examples
+    "warmup_steps": 150,
+    "save_steps": 250,  # Save checkpoint every 250 steps
+    "logging_steps": 10,
+    "fp16": True,  # Use mixed precision
+    "save_total_limit": 5,  # Keep only last 5 checkpoints to save disk space
+    "lr_scheduler": "cosine",  # Better learning rate schedule
+    "weight_decay": 0.01,  # Regularization
+}
+
+# LoRA configuration for memory efficiency
+LORA_CONFIG = {
+    "r": 16,  # LoRA rank
+    "lora_alpha": 32,
+    "target_modules": ["q_proj", "k_proj", "v_proj", "o_proj"],
+    "lora_dropout": 0.05,
+    "bias": "none",
+    "task_type": "CAUSAL_LM"
+}
+
+def load_and_prepare_data():
+    """Load JSONL training data with content validation"""
+    print("📂 Loading training data...")
+    
+    data = []
+    truncated_count = 0
+    total_chars = 0
+    
+    with open(TRAINING_DATA, 'r', encoding='utf-8') as f:
+        for line in f:
+            if line.strip():
+                item = json.loads(line)
+                text = item["text"]
+                data.append({"text": text})
+                
+                total_chars += len(text)
+                
+                # Check if example has all expected parts
+                has_tool_calls = "<|tool_start|>" in text and "<|tool_end|>" in text
+                has_code = "<|code_start|>" in text and "<|code_end|>" in text
+                has_end = "<|end|>" in text
+                
+                if not (has_tool_calls and has_code and has_end):
+                    truncated_count += 1
+    
+    avg_length = total_chars // len(data) if data else 0
+    print(f"✓ Loaded {len(data)} training examples")
+    print(f"  Average length: {avg_length:,} characters")
+    if truncated_count > 0:
+        print(f"  ⚠️  {truncated_count} examples may be truncated or incomplete")
+    
+    return Dataset.from_list(data)
+
+def setup_model_and_tokenizer():
+    """Load model with 8-bit quantization and prepare for LoRA"""
+    print("🤖 Loading model and tokenizer...")
+    
+    # Load tokenizer
+    tokenizer = AutoTokenizer.from_pretrained(
+        MODEL_PATH,
+        trust_remote_code=True,
+        use_fast=False
+    )
+    
+    # Add special tokens
+    print("🔧 Adding special tokens...")
+    num_added = tokenizer.add_special_tokens(SPECIAL_TOKENS)
+    print(f"✓ Added {num_added} special tokens")
+    
+    # Set padding token
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+    
+    # Load model with 8-bit quantization (saves VRAM)
+    print("💾 Loading model with 8-bit quantization...")
+    model = AutoModelForCausalLM.from_pretrained(
+        MODEL_PATH,
+        load_in_8bit=True,
+        device_map="auto",
+        trust_remote_code=True,
+        torch_dtype=torch.float16
+    )
+    
+    # Resize token embeddings for new tokens
+    model.resize_token_embeddings(len(tokenizer))
+    
+    # Prepare model for k-bit training
+    model = prepare_model_for_kbit_training(model)
+    
+    # Apply LoRA
+    print("🔗 Applying LoRA configuration...")
+    lora_config = LoraConfig(**LORA_CONFIG)
+    model = get_peft_model(model, lora_config)
+    
+    # Print trainable parameters
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    total_params = sum(p.numel() for p in model.parameters())
+    print(f"✓ Trainable params: {trainable_params:,} ({100 * trainable_params / total_params:.2f}%)")
+    
+    return model, tokenizer
+
+def tokenize_dataset(dataset, tokenizer):
+    """Tokenize the dataset with smart truncation"""
+    print("🔤 Tokenizing dataset...")
+    
+    truncated_examples = 0
+    total_examples = len(dataset)
+    
+    def tokenize_function(examples):
+        nonlocal truncated_examples
+        
+        # Tokenize with truncation
+        result = tokenizer(
+            examples["text"],
+            truncation=True,
+            max_length=TRAINING_CONFIG["max_seq_length"],
+            padding="max_length",
+            return_tensors=None  # Don't convert to tensors yet
+        )
+        
+        # Check for truncation
+        for i, text in enumerate(examples["text"]):
+            original_tokens = tokenizer.encode(text, add_special_tokens=False)
+            if len(original_tokens) > TRAINING_CONFIG["max_seq_length"]:
+                truncated_examples += 1
+        
+        return result
+    
+    tokenized = dataset.map(
+        tokenize_function,
+        batched=True,
+        remove_columns=dataset.column_names,
+        desc="Tokenizing"
+    )
+    
+    print(f"✓ Tokenization complete")
+    if truncated_examples > 0:
+        pct = (truncated_examples / total_examples) * 100
+        print(f"  ⚠️  {truncated_examples}/{total_examples} examples ({pct:.1f}%) were truncated")
+        print(f"     Consider increasing max_seq_length if this is high")
+    
+    return tokenized
+
+class ProgressCallback(TrainerCallback):
+    """Custom callback for progress tracking with ETA"""
+    
+    def __init__(self, total_steps):
+        self.total_steps = total_steps
+        self.start_time = None
+        self.pbar = None
+        
+    def on_train_begin(self, args, state, control, **kwargs):
+        self.start_time = time.time()
+        self.pbar = tqdm(total=self.total_steps, desc="Training", unit="step")
+        
+    def on_log(self, args, state, control, logs=None, **kwargs):
+        if self.pbar and logs:
+            current_step = state.global_step
+            self.pbar.n = current_step
+            
+            # Calculate ETA
+            elapsed = time.time() - self.start_time
+            steps_per_sec = current_step / elapsed if elapsed > 0 else 0
+            remaining_steps = self.total_steps - current_step
+            eta_seconds = remaining_steps / steps_per_sec if steps_per_sec > 0 else 0
+            
+            # Format ETA
+            eta_hours = int(eta_seconds // 3600)
+            eta_mins = int((eta_seconds % 3600) // 60)
+            eta_secs = int(eta_seconds % 60)
+            
+            # Update progress bar
+            postfix = {}
+            if 'loss' in logs:
+                postfix['loss'] = f"{logs['loss']:.4f}"
+            if 'learning_rate' in logs:
+                postfix['lr'] = f"{logs['learning_rate']:.2e}"
+            postfix['ETA'] = f"{eta_hours:02d}:{eta_mins:02d}:{eta_secs:02d}"
+            
+            self.pbar.set_postfix(postfix)
+            self.pbar.refresh()
+            
+    def on_save(self, args, state, control, **kwargs):
+        if self.pbar:
+            print(f"\n💾 Checkpoint saved at step {state.global_step}")
+            
+    def on_train_end(self, args, state, control, **kwargs):
+        if self.pbar:
+            self.pbar.close()
+
+def train():
+    """Main training function"""
+    print("="*60)
+    print("Fine-tuning Qwen2.5-Coder-1.5B-Instruct")
+    print("Optimized for RTX 4060 (8GB VRAM)")
+    print("="*60)
+    
+    # Check GPU
+    if torch.cuda.is_available():
+        gpu_name = torch.cuda.get_device_name(0)
+        gpu_memory = torch.cuda.get_device_properties(0).total_memory / 1e9
+        print(f"🎮 GPU: {gpu_name} ({gpu_memory:.1f}GB)")
+    else:
+        print("⚠️  No GPU detected! Training will be very slow.")
+    
+    # Load data
+    dataset = load_and_prepare_data()
+    
+    # Setup model and tokenizer
+    model, tokenizer = setup_model_and_tokenizer()
+    
+    # Tokenize dataset
+    tokenized_dataset = tokenize_dataset(dataset, tokenizer)
+    
+    # Calculate total training steps
+    total_steps = (len(tokenized_dataset) // TRAINING_CONFIG["batch_size"] // TRAINING_CONFIG["gradient_accumulation_steps"]) * TRAINING_CONFIG["num_epochs"]
+    print(f"\n📊 Training Configuration:")
+    print(f"   Examples: {len(tokenized_dataset)}")
+    print(f"   Epochs: {TRAINING_CONFIG['num_epochs']}")
+    print(f"   Total steps: {total_steps}")
+    print(f"   Checkpoint every: {TRAINING_CONFIG['save_steps']} steps")
+    print(f"   Max checkpoints kept: {TRAINING_CONFIG['save_total_limit']}")
+    
+    # Training arguments with optimizations
+    training_args = TrainingArguments(
+        output_dir=CHECKPOINT_DIR,
+        num_train_epochs=TRAINING_CONFIG["num_epochs"],
+        per_device_train_batch_size=TRAINING_CONFIG["batch_size"],
+        gradient_accumulation_steps=TRAINING_CONFIG["gradient_accumulation_steps"],
+        learning_rate=TRAINING_CONFIG["learning_rate"],
+        fp16=TRAINING_CONFIG["fp16"],
+        save_steps=TRAINING_CONFIG["save_steps"],
+        logging_steps=TRAINING_CONFIG["logging_steps"],
+        warmup_steps=TRAINING_CONFIG["warmup_steps"],
+        save_total_limit=TRAINING_CONFIG["save_total_limit"],
+        logging_dir="./logs",
+        report_to="none",  # Disable wandb/tensorboard
+        optim="paged_adamw_8bit",  # Memory efficient optimizer
+        gradient_checkpointing=True,  # Save VRAM
+        max_grad_norm=1.0,
+        disable_tqdm=True,  # Disable default tqdm, we use custom callback
+        lr_scheduler_type=TRAINING_CONFIG["lr_scheduler"],  # Cosine schedule
+        weight_decay=TRAINING_CONFIG["weight_decay"],  # Regularization
+        dataloader_num_workers=2,  # Parallel data loading
+        group_by_length=False,  # Don't group - ensure all parts seen equally
+        length_column_name=None,  # Process examples as-is
+    )
+    
+    # Data collator
+    data_collator = DataCollatorForLanguageModeling(
+        tokenizer=tokenizer,
+        mlm=False
+    )
+    
+    # Initialize progress callback
+    progress_callback = ProgressCallback(total_steps)
+    
+    # Initialize trainer
+    trainer = Trainer(
+        model=model,
+        args=training_args,
+        train_dataset=tokenized_dataset,
+        data_collator=data_collator,
+        callbacks=[progress_callback],
+    )
+    
+    # Start training
+    print("\n🚀 Starting training...\n")
+    trainer.train()
+    
+    # Save final model
+    print("\n💾 Saving final model...")
+    model.save_pretrained(OUTPUT_DIR)
+    tokenizer.save_pretrained(OUTPUT_DIR)
+    
+    print("\n" + "="*60)
+    print("✓ Training complete!")
+    print("="*60)
+    print(f"Model saved to: {OUTPUT_DIR}")
+    print(f"Checkpoints saved to: {CHECKPOINT_DIR}")
+    print("\nTo use the model:")
+    print(f"  from transformers import AutoModelForCausalLM, AutoTokenizer")
+    print(f"  model = AutoModelForCausalLM.from_pretrained('{OUTPUT_DIR}')")
+    print(f"  tokenizer = AutoTokenizer.from_pretrained('{OUTPUT_DIR}')")
+    print("="*60)
+
+if __name__ == "__main__":
+    train()
