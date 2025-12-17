@@ -42,21 +42,68 @@ SPECIAL_TOKENS = {
     ]
 }
 
-# RTX 4060 optimized settings (8GB VRAM)
-TRAINING_CONFIG = {
-    "batch_size": 1,  # Small batch for 8GB VRAM
-    "gradient_accumulation_steps": 8,  # Effective batch size = 8
-    "learning_rate": 2e-4,
-    "num_epochs": 15,  # More epochs to fully learn all content
-    "max_seq_length": 4096,  # Longer sequences to capture full examples
-    "warmup_steps": 150,
-    "save_steps": 250,  # Save checkpoint every 250 steps
-    "logging_steps": 10,
-    "fp16": True,  # Use mixed precision
-    "save_total_limit": 5,  # Keep only last 5 checkpoints to save disk space
-    "lr_scheduler": "cosine",  # Better learning rate schedule
-    "weight_decay": 0.01,  # Regularization
-}
+# Auto-detect GPU and set optimal config
+def get_training_config():
+    if torch.cuda.is_available():
+        gpu_memory = torch.cuda.get_device_properties(0).total_memory / 1e9
+        gpu_name = torch.cuda.get_device_name(0).lower()
+        
+        # H200 / H100 / A100 (80GB+)
+        if gpu_memory > 70 or 'h100' in gpu_name or 'h200' in gpu_name or 'a100' in gpu_name:
+            return {
+                "batch_size": 16,  # Large batch for 80GB+ VRAM
+                "gradient_accumulation_steps": 1,
+                "learning_rate": 3e-4,
+                "num_epochs": 10,  # Fewer epochs with larger batches
+                "max_seq_length": 4096,
+                "warmup_steps": 150,
+                "save_steps": 250,
+                "logging_steps": 10,
+                "fp16": False,
+                "bf16": True,  # BF16 for H100/H200
+                "save_total_limit": 5,
+                "lr_scheduler": "cosine",
+                "weight_decay": 0.01,
+                "use_8bit": False,  # No quantization needed
+            }
+        # RTX 4090 / A6000 (24GB)
+        elif gpu_memory > 20:
+            return {
+                "batch_size": 4,
+                "gradient_accumulation_steps": 2,
+                "learning_rate": 2e-4,
+                "num_epochs": 12,
+                "max_seq_length": 4096,
+                "warmup_steps": 150,
+                "save_steps": 250,
+                "logging_steps": 10,
+                "fp16": True,
+                "bf16": False,
+                "save_total_limit": 5,
+                "lr_scheduler": "cosine",
+                "weight_decay": 0.01,
+                "use_8bit": True,
+            }
+    
+    # RTX 4060 / Small GPU (8GB)
+    return {
+        "batch_size": 1,
+        "gradient_accumulation_steps": 8,
+        "learning_rate": 2e-4,
+        "num_epochs": 15,
+        "max_seq_length": 4096,
+        "warmup_steps": 150,
+        "save_steps": 250,
+        "logging_steps": 10,
+        "fp16": True,
+        "bf16": False,
+        "save_total_limit": 5,
+        "lr_scheduler": "cosine",
+        "weight_decay": 0.01,
+        "use_8bit": True,
+    }
+
+TRAINING_CONFIG = get_training_config()
 
 # LoRA configuration for memory efficiency
 LORA_CONFIG = {
@@ -121,14 +168,17 @@ def setup_model_and_tokenizer():
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
     
-    # Load model with 8-bit quantization (saves VRAM)
-    print("💾 Loading model with 8-bit quantization...")
+    # Load model with appropriate quantization
+    use_8bit = TRAINING_CONFIG.get("use_8bit", True)
+    dtype = torch.bfloat16 if TRAINING_CONFIG.get("bf16", False) else torch.float16
+    
+    print(f"💾 Loading model {'with 8-bit quantization' if use_8bit else 'in full precision'}...")
     model = AutoModelForCausalLM.from_pretrained(
         MODEL_PATH,
-        load_in_8bit=True,
+        load_in_8bit=use_8bit,
         device_map="auto",
         trust_remote_code=True,
-        torch_dtype=torch.float16
+        torch_dtype=dtype
     )
     
     # Resize token embeddings for new tokens
