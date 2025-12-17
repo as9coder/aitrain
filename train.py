@@ -50,16 +50,17 @@ def get_training_config():
         
         # H200 / H100 / A100 (80GB+)
         if gpu_memory > 70 or 'h100' in gpu_name or 'h200' in gpu_name or 'a100' in gpu_name:
-            # H200 has 141GB - maximize it!
-            batch_size = 64 if gpu_memory > 130 else 32  # H200 gets 64, H100 gets 32
+            # H200 has 141GB - balance batch size and sequence length
+            batch_size = 16 if gpu_memory > 130 else 8  # More conservative for H200
+            seq_len = 6144 if gpu_memory > 130 else 4096  # Reasonable for long examples
             return {
-                "batch_size": batch_size,  # MASSIVE batch to use all VRAM
-                "gradient_accumulation_steps": 1,  # No accumulation needed
-                "learning_rate": 5e-4,  # Higher LR for large batches
-                "num_epochs": 8,  # Fewer epochs with huge batches
-                "max_seq_length": 8192,  # Double the sequence length
+                "batch_size": batch_size,
+                "gradient_accumulation_steps": 2,  # Effective batch = 32
+                "learning_rate": 3e-4,
+                "num_epochs": 10,
+                "max_seq_length": seq_len,
                 "warmup_steps": 200,
-                "save_steps": 100,  # Save more often (faster epochs)
+                "save_steps": 100,
                 "logging_steps": 5,
                 "fp16": False,
                 "bf16": True,  # BF16 for H100/H200
@@ -67,8 +68,8 @@ def get_training_config():
                 "lr_scheduler": "cosine",
                 "weight_decay": 0.01,
                 "use_8bit": False,  # No quantization
-                "lora_rank": 64,  # Much higher rank
-                "dataloader_num_workers": 4,  # More workers
+                "lora_rank": 32,  # Balanced rank
+                "dataloader_num_workers": 4,
             }
         # RTX 4090 / A6000 (24GB)
         elif gpu_memory > 20:
