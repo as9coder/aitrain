@@ -93,19 +93,22 @@ def get_training_config():
     # RTX 4060 / Small GPU (8GB)
     return {
         "batch_size": 1,
-        "gradient_accumulation_steps": 8,
+        "gradient_accumulation_steps": 16,  # Effective batch = 16
         "learning_rate": 2e-4,
-        "num_epochs": 15,
-        "max_seq_length": 4096,
-        "warmup_steps": 150,
-        "save_steps": 250,
+        "num_epochs": 20,  # More epochs for better learning
+        "max_seq_length": 2048,  # Reduced to avoid OOM
+        "warmup_steps": 100,
+        "save_steps": 200,
         "logging_steps": 10,
         "fp16": True,
         "bf16": False,
-        "save_total_limit": 5,
+        "save_total_limit": 3,  # Keep fewer checkpoints
         "lr_scheduler": "cosine",
         "weight_decay": 0.01,
         "use_8bit": True,
+        "lora_rank": 16,  # Lower rank for 8GB
+        "dataloader_num_workers": 2,
+        "gradient_checkpointing": True,
     }
 
 TRAINING_CONFIG = get_training_config()
