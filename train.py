@@ -199,8 +199,13 @@ def setup_model_and_tokenizer():
     # Resize token embeddings for new tokens
     model.resize_token_embeddings(len(tokenizer))
     
-    # Prepare model for k-bit training
-    model = prepare_model_for_kbit_training(model)
+    # Prepare model for k-bit training (only if using quantization)
+    if use_8bit:
+        model = prepare_model_for_kbit_training(model)
+    else:
+        # For full precision training, enable gradient checkpointing
+        model.gradient_checkpointing_enable()
+        model.enable_input_require_grads()
     
     # Apply LoRA with dynamic config
     print("🔗 Applying LoRA configuration...")
