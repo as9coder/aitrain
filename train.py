@@ -50,21 +50,25 @@ def get_training_config():
         
         # H200 / H100 / A100 (80GB+)
         if gpu_memory > 70 or 'h100' in gpu_name or 'h200' in gpu_name or 'a100' in gpu_name:
+            # H200 has 141GB - maximize it!
+            batch_size = 64 if gpu_memory > 130 else 32  # H200 gets 64, H100 gets 32
             return {
-                "batch_size": 16,  # Large batch for 80GB+ VRAM
-                "gradient_accumulation_steps": 1,
-                "learning_rate": 3e-4,
-                "num_epochs": 10,  # Fewer epochs with larger batches
-                "max_seq_length": 4096,
-                "warmup_steps": 150,
-                "save_steps": 250,
-                "logging_steps": 10,
+                "batch_size": batch_size,  # MASSIVE batch to use all VRAM
+                "gradient_accumulation_steps": 1,  # No accumulation needed
+                "learning_rate": 5e-4,  # Higher LR for large batches
+                "num_epochs": 8,  # Fewer epochs with huge batches
+                "max_seq_length": 8192,  # Double the sequence length
+                "warmup_steps": 200,
+                "save_steps": 100,  # Save more often (faster epochs)
+                "logging_steps": 5,
                 "fp16": False,
                 "bf16": True,  # BF16 for H100/H200
                 "save_total_limit": 5,
                 "lr_scheduler": "cosine",
                 "weight_decay": 0.01,
-                "use_8bit": False,  # No quantization needed
+                "use_8bit": False,  # No quantization
+                "lora_rank": 64,  # Much higher rank
+                "dataloader_num_workers": 4,  # More workers
             }
         # RTX 4090 / A6000 (24GB)
         elif gpu_memory > 20:
@@ -105,15 +109,26 @@ def get_training_config():
 
 TRAINING_CONFIG = get_training_config()
 
-# LoRA configuration for memory efficiency
-LORA_CONFIG = {
-    "r": 16,  # LoRA rank
-    "lora_alpha": 32,
-    "target_modules": ["q_proj", "k_proj", "v_proj", "o_proj"],
-    "lora_dropout": 0.05,
-    "bias": "none",
-    "task_type": "CAUSAL_LM"
-}
+# LoRA configuration - will be updated based on GPU
+def get_lora_config():
+    rank = TRAINING_CONFIG.get("lora_rank", 16)
+    
+    # More target modules for better quality
+    target_modules = [
+        "q_proj", "k_proj", "v_proj", "o_proj",  # Attention
+        "gate_proj", "up_proj", "down_proj"  # MLP layers
+    ]
+    
+    return {
+        "r": rank,
+        "lora_alpha": rank * 2,  # Alpha = 2x rank
+        "target_modules": target_modules,
+        "lora_dropout": 0.05,
+        "bias": "none",
+        "task_type": "CAUSAL_LM"
+    }
+
+LORA_CONFIG = get_lora_config()
 
 def load_and_prepare_data():
     """Load JSONL training data with content validation"""
@@ -187,8 +202,10 @@ def setup_model_and_tokenizer():
     # Prepare model for k-bit training
     model = prepare_model_for_kbit_training(model)
     
-    # Apply LoRA
+    # Apply LoRA with dynamic config
     print("🔗 Applying LoRA configuration...")
+    LORA_CONFIG = get_lora_config()  # Refresh config with current TRAINING_CONFIG
+    print(f"   LoRA rank: {LORA_CONFIG['r']}, Target modules: {len(LORA_CONFIG['target_modules'])}")
     lora_config = LoraConfig(**LORA_CONFIG)
     model = get_peft_model(model, lora_config)
     
@@ -300,6 +317,8 @@ def train():
         gpu_name = torch.cuda.get_device_name(0)
         gpu_memory = torch.cuda.get_device_properties(0).total_memory / 1e9
         print(f"🎮 GPU: {gpu_name} ({gpu_memory:.1f}GB)")
+        print(f"📊 Training Config: batch_size={TRAINING_CONFIG['batch_size']}, seq_len={TRAINING_CONFIG['max_seq_length']}, LoRA_rank={TRAINING_CONFIG.get('lora_rank', 16)}")
+        print(f"⚡ Estimated VRAM usage: ~{gpu_memory * 0.85:.0f}GB (targeting 85% utilization)")
     else:
         print("⚠️  No GPU detected! Training will be very slow.")
     
